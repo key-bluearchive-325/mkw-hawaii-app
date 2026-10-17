@@ -1,0 +1,253 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Generate project
+        run: |
+          mkdir -p app/src/main/java/com/example/datausage
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "DataUsage"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+          EOF
+          echo "android.useAndroidX=true" > gradle.properties
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+          android {
+              namespace = "com.example.datausage"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.datausage"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildFeatures { compose = true }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.09.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+              <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
+              <application android:label="DataUsage" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/example/datausage/MainActivity.kt <<'EOF'
+          package com.example.datausage
+
+          import android.app.AppOpsManager
+          import android.app.usage.NetworkStats
+          import android.app.usage.NetworkStatsManager
+          import android.content.Context
+          import android.content.Intent
+          import android.net.ConnectivityManager
+          import android.net.TrafficStats
+          import android.os.Bundle
+          import android.os.Process
+          import android.provider.Settings
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.withContext
+          import java.util.Calendar
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { Root() } } }
+              }
+          }
+
+          data class AppUsage(val label: String, val pkg: String, val wifi: Long, val mobile: Long) {
+              val total get() = wifi + mobile
+          }
+
+          fun hasUsageAccess(ctx: Context): Boolean {
+              val ops = ctx.getSystemService(AppOpsManager::class.java)
+              return ops.unsafeCheckOpNoThrow(
+                  AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), ctx.packageName
+              ) == AppOpsManager.MODE_ALLOWED
+          }
+
+          fun fmt(b: Long): String = when {
+              b >= 1L shl 30 -> "%.2f GB".format(b / (1L shl 30).toDouble())
+              b >= 1L shl 20 -> "%.1f MB".format(b / (1L shl 20).toDouble())
+              b >= 1L shl 10 -> "%.0f KB".format(b / 1024.0)
+              else -> "$b B"
+          }
+
+          private fun sumByUid(nsm: NetworkStatsManager, type: Int, start: Long, end: Long): Map<Int, Long> {
+              val map = HashMap<Int, Long>()
+              val stats = nsm.querySummary(type, null, start, end)
+              val bucket = NetworkStats.Bucket()
+              while (stats.hasNextBucket()) {
+                  stats.getNextBucket(bucket)
+                  map[bucket.uid] = (map[bucket.uid] ?: 0L) + bucket.rxBytes + bucket.txBytes
+              }
+              stats.close()
+              return map
+          }
+
+          /** range: 0=today, 1=7 days, 2=30 days */
+          fun loadUsage(ctx: Context, range: Int): List<AppUsage> {
+              val nsm = ctx.getSystemService(Context.NETWORK_STATS_SERVICE) as NetworkStatsManager
+              val cal = Calendar.getInstance().apply {
+                  set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
+                  set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+                  when (range) { 1 -> add(Calendar.DAY_OF_YEAR, -6); 2 -> add(Calendar.DAY_OF_YEAR, -29) }
+              }
+              val start = cal.timeInMillis
+              val end = System.currentTimeMillis()
+              val wifi = sumByUid(nsm, ConnectivityManager.TYPE_WIFI, start, end)
+              val mobile = sumByUid(nsm, ConnectivityManager.TYPE_MOBILE, start, end)
+              val pm = ctx.packageManager
+              return (wifi.keys + mobile.keys).distinct().mapNotNull { uid ->
+                  val w = wifi[uid] ?: 0L
+                  val m = mobile[uid] ?: 0L
+                  if (w + m == 0L) return@mapNotNull null
+                  val pkg = pm.getPackagesForUid(uid)?.firstOrNull()
+                  val label = pkg?.let {
+                      runCatching { pm.getApplicationLabel(pm.getApplicationInfo(it, 0)).toString() }.getOrNull()
+                  } ?: "System/Other (uid $uid)"
+                  AppUsage(label, pkg ?: "-", w, m)
+              }.sortedByDescending { it.total }
+          }
+
+          @Composable
+          fun Root() {
+              val ctx = LocalContext.current
+              var granted by remember { mutableStateOf(hasUsageAccess(ctx)) }
+              LaunchedEffect(granted) {
+                  while (!granted) { delay(1000); granted = hasUsageAccess(ctx) }
+              }
+              if (granted) UsageScreen() else {
+                  Column(
+                      Modifier.fillMaxSize().padding(24.dp),
+                      verticalArrangement = Arrangement.Center,
+                      horizontalAlignment = Alignment.CenterHorizontally
+                  ) {
+                      Text("通信量を取得するには「使用状況へのアクセス」の許可が必要です。")
+                      Spacer(Modifier.height(16.dp))
+                      Button(onClick = {
+                          ctx.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                      }) { Text("設定を開く") }
+                  }
+              }
+          }
+
+          @Composable
+          fun UsageScreen() {
+              val ctx = LocalContext.current
+              var range by remember { mutableIntStateOf(0) }
+              var list by remember { mutableStateOf(emptyList<AppUsage>()) }
+              var speed by remember { mutableStateOf(0L to 0L) }
+
+              LaunchedEffect(range) {
+                  while (true) {
+                      list = withContext(Dispatchers.IO) { loadUsage(ctx, range) }
+                      delay(3000)
+                  }
+              }
+              LaunchedEffect(Unit) {
+                  var rx = TrafficStats.getTotalRxBytes()
+                  var tx = TrafficStats.getTotalTxBytes()
+                  while (true) {
+                      delay(1000)
+                      val r = TrafficStats.getTotalRxBytes()
+                      val t = TrafficStats.getTotalTxBytes()
+                      speed = (r - rx) to (t - tx)
+                      rx = r; tx = t
+                  }
+              }
+
+              val max = (list.firstOrNull()?.total ?: 1L).toFloat()
+              Column(Modifier.fillMaxSize().padding(16.dp)) {
+                  Text("現在の速度", style = MaterialTheme.typography.labelMedium)
+                  Text("↓ ${fmt(speed.first)}/s   ↑ ${fmt(speed.second)}/s", style = MaterialTheme.typography.titleLarge)
+                  Spacer(Modifier.height(12.dp))
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      listOf("今日", "7日間", "30日間").forEachIndexed { i, s ->
+                          FilterChip(selected = range == i, onClick = { range = i }, label = { Text(s) })
+                      }
+                  }
+                  Spacer(Modifier.height(8.dp))
+                  Text("合計: ${fmt(list.sumOf { it.total })}  (Wi-Fi ${fmt(list.sumOf { it.wifi })} / モバイル ${fmt(list.sumOf { it.mobile })})")
+                  Spacer(Modifier.height(8.dp))
+                  LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                      items(list, key = { it.pkg + it.label }) { a ->
+                          Column {
+                              Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                  Text(a.label, Modifier.weight(1f), maxLines = 1)
+                                  Text(fmt(a.total))
+                              }
+                              LinearProgressIndicator(progress = { a.total / max }, Modifier.fillMaxWidth())
+                              Text(
+                                  "Wi-Fi ${fmt(a.wifi)} / モバイル ${fmt(a.mobile)}",
+                                  style = MaterialTheme.typography.bodySmall
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DataUsage-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
