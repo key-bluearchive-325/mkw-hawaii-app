@@ -9,6 +9,8 @@ on:
         description: パッケージ名（英小文字・数字・ドット）
         default: com.example.datausage
   push:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -406,4 +408,414 @@ jobs:
           fun loadAll(ctx: Context, mode: Int, offset: Int): Loaded {
               val (start, end) = rangeOf(mode, offset)
               val nsm = ctx.getSystemService(Context.NETWORK_STATS_SERVICE) as NetworkStatsManager
-              
+              val wifi = sumByUid(nsm, ConnectivityManager.TYPE_WIFI, start, end)
+              val mobile = sumByUid(nsm, ConnectivityManager.TYPE_MOBILE, start, end)
+              val pm = ctx.packageManager
+
+              // [0]=wifi, [1]=mobile, [2]=画面使用時間(ms)
+              val byPkg = HashMap<String, LongArray>()
+              fun keyOf(uid: Int) = pm.getPackagesForUid(uid)?.firstOrNull() ?: "uid:$uid"
+              wifi.forEach { (uid, v) -> byPkg.getOrPut(keyOf(uid)) { LongArray(3) }[0] += v }
+              mobile.forEach { (uid, v) -> byPkg.getOrPut(keyOf(uid)) { LongArray(3) }[1] += v }
+
+              val usm = ctx.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+              usm.queryAndAggregateUsageStats(start, end).forEach { (p, s) ->
+                  if (s.totalTimeInForeground > 0) byPkg.getOrPut(p) { LongArray(3) }[2] = s.totalTimeInForeground
+              }
+
+              val apps = byPkg.mapNotNull { (pkg, a) ->
+                  if (a.all { it == 0L }) return@mapNotNull null
+                  val label = runCatching {
+                      pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+                  }.getOrNull() ?: if (pkg.startsWith("uid:")) "システム/その他 ($pkg)" else pkg
+                  AppUsage(label, pkg, a[0], a[1], a[2], iconOf(ctx, pkg))
+              }
+
+              val days = if (mode == 0) emptyList() else {
+                  val out = ArrayList<DayTotal>()
+                  val c = Calendar.getInstance().apply { timeInMillis = start }
+                  val wf = SimpleDateFormat("E", Locale.JAPAN)
+                  while (c.timeInMillis < end) {
+                      val s = c.timeInMillis
+                      val label = if (mode == 1) wf.format(Date(s)) else c.get(Calendar.DAY_OF_MONTH).toString()
+                      c.add(Calendar.DAY_OF_YEAR, 1)
+                      val e = minOf(c.timeInMillis, end)
+                      out += DayTotal(
+                          label,
+                          deviceTotal(nsm, ConnectivityManager.TYPE_WIFI, s, e),
+                          deviceTotal(nsm, ConnectivityManager.TYPE_MOBILE, s, e)
+                      )
+                  }
+                  out
+              }
+              return Loaded(apps, days)
+          }
+
+          // ---------- UI ----------
+          @Composable
+          fun Root() {
+              val ctx = LocalContext.current
+              var granted by remember { mutableStateOf(hasUsageAccess(ctx)) }
+              LaunchedEffect(granted) {
+                  while (!granted) { delay(1000); granted = hasUsageAccess(ctx) }
+              }
+              if (granted) UsageScreen() else {
+                  Column(
+                      Modifier.fillMaxSize().padding(32.dp),
+                      verticalArrangement = Arrangement.Center,
+                      horizontalAlignment = Alignment.CenterHorizontally
+                  ) {
+                      Text("📶", fontSize = 56.sp)
+                      Spacer(Modifier.height(16.dp))
+                      Text("使用状況へのアクセスを許可してください", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                      Spacer(Modifier.height(8.dp))
+                      Text(
+                          "通信量と画面使用時間の取得に必要です。設定でこのアプリをオンにしてください。",
+                          color = MaterialTheme.colorScheme.onSurfaceVariant
+                      )
+                      Spacer(Modifier.height(24.dp))
+                      Button(onClick = {
+                          ctx.startActivity(
+                              Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                          )
+                      }) { Text("設定を開く") }
+                  }
+              }
+          }
+
+          @Composable
+          fun UsageScreen() {
+              val ctx = LocalContext.current
+              var mode by remember { mutableIntStateOf(0) }
+              var offset by remember { mutableIntStateOf(0) }
+              var sortBy by remember { mutableIntStateOf(0) }
+              var showSettings by remember { mutableStateOf(false) }
+              var data by remember { mutableStateOf(Loaded()) }
+              var speed by remember { mutableStateOf(0L to 0L) }
+              var batt by remember { mutableStateOf(readBattery(ctx)) }
+
+              BackHandler(enabled = showSettings) { showSettings = false }
+
+              LaunchedEffect(mode, offset) {
+                  while (true) {
+                      withContext(Dispatchers.IO) { runCatching { loadAll(ctx, mode, offset) }.getOrNull() }
+                          ?.let { data = it }
+                      batt = readBattery(ctx)
+                      if (offset < 0) break
+                      delay(3000)
+                  }
+              }
+              LaunchedEffect(Unit) {
+                  var rx = TrafficStats.getTotalRxBytes()
+                  var tx = TrafficStats.getTotalTxBytes()
+                  while (true) {
+                      delay(1000)
+                      val r = TrafficStats.getTotalRxBytes()
+                      val t = TrafficStats.getTotalTxBytes()
+                      speed = (r - rx) to (t - tx)
+                      rx = r; tx = t
+                  }
+              }
+
+              if (showSettings) { SettingsScreen { showSettings = false }; return }
+
+              val sorted = if (sortBy == 0) data.apps.sortedByDescending { it.total }
+              else data.apps.sortedByDescending { it.fgMs }
+              val max = (data.apps.maxOfOrNull { it.total } ?: 1L).coerceAtLeast(1L).toFloat()
+
+              LazyColumn(
+                  Modifier.fillMaxSize(),
+                  contentPadding = PaddingValues(16.dp),
+                  verticalArrangement = Arrangement.spacedBy(12.dp)
+              ) {
+                  item { Header(speed, data.apps, batt) { showSettings = true } }
+                  item {
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          listOf("日", "週", "月").forEachIndexed { i, s ->
+                              FilterChip(
+                                  selected = mode == i,
+                                  onClick = { mode = i; offset = 0 },
+                                  label = { Text(s) }, shape = RoundedCornerShape(50)
+                              )
+                          }
+                      }
+                  }
+                  item {
+                      Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                          TextButton(onClick = { offset-- }) { Text("◀") }
+                          Text(
+                              periodLabel(mode, offset), Modifier.weight(1f),
+                              textAlign = TextAlign.Center, fontWeight = FontWeight.SemiBold, fontSize = 16.sp
+                          )
+                          TextButton(onClick = { offset++ }, enabled = offset < 0) { Text("▶") }
+                      }
+                  }
+                  if (mode > 0 && data.days.isNotEmpty()) item { DayChart(data.days, mode) }
+                  item {
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                          Text("アプリ別", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                          FilterChip(
+                              selected = sortBy == 1,
+                              onClick = { sortBy = if (sortBy == 0) 1 else 0 },
+                              label = { Text(if (sortBy == 0) "通信量順" else "使用時間順") },
+                              shape = RoundedCornerShape(50)
+                          )
+                      }
+                  }
+                  if (sorted.isEmpty()) item {
+                      Text(
+                          "この期間のデータがありません（OSが保持している期間より前の可能性があります）",
+                          color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp
+                      )
+                  }
+                  items(sorted, key = { it.pkg }) { a -> AppRow(a, max) }
+              }
+          }
+
+          @Composable
+          fun Stat(label: String, value: String) {
+              Column {
+                  Text(label, color = Color.White.copy(alpha = 0.7f), fontSize = 11.sp)
+                  Text(value, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+              }
+          }
+
+          @Composable
+          fun Header(speed: Pair<Long, Long>, list: List<AppUsage>, batt: Batt, onSettings: () -> Unit) {
+              Box(
+                  Modifier.fillMaxWidth()
+                      .clip(RoundedCornerShape(28.dp))
+                      .background(Brush.linearGradient(listOf(Color(0xFF5B6CFF), Color(0xFF9B5CFF))))
+                      .padding(20.dp)
+              ) {
+                  Text(
+                      "⚙", fontSize = 22.sp, color = Color.White,
+                      modifier = Modifier.align(Alignment.TopEnd).clickable { onSettings() }.padding(4.dp)
+                  )
+                  Column {
+                      Text("リアルタイム速度", color = Color.White.copy(alpha = 0.75f), fontSize = 12.sp)
+                      Text("↓ ${fmt(speed.first)}/s", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+                      Text("↑ ${fmt(speed.second)}/s", color = Color.White.copy(alpha = 0.9f), fontSize = 16.sp)
+                      Spacer(Modifier.height(18.dp))
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                          Stat("合計", fmt(list.sumOf { it.total }))
+                          Stat("Wi-Fi", fmt(list.sumOf { it.wifi }))
+                          Stat("モバイル", fmt(list.sumOf { it.mobile }))
+                      }
+                      Spacer(Modifier.height(16.dp))
+                      Text(
+                          "🔋 ${batt.pct}%" + (if (batt.charging) " ⚡充電中" else "") + "  ・  🌡 ${"%.1f".format(batt.tempC)}°C",
+                          color = Color.White.copy(alpha = 0.9f), fontSize = 13.sp
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          fun DayChart(days: List<DayTotal>, mode: Int) {
+              val cs = MaterialTheme.colorScheme
+              val max = (days.maxOfOrNull { it.wifi + it.mobile } ?: 1L).coerceAtLeast(1L).toFloat()
+              Surface(shape = RoundedCornerShape(20.dp), color = cs.surface, tonalElevation = 1.dp) {
+                  Column(Modifier.padding(14.dp)) {
+                      Text("日ごとの通信量（最大 ${fmt(max.toLong())}）", fontSize = 12.sp, color = cs.onSurfaceVariant)
+                      Spacer(Modifier.height(8.dp))
+                      Row(
+                          Modifier.fillMaxWidth().height(90.dp),
+                          horizontalArrangement = Arrangement.spacedBy(2.dp),
+                          verticalAlignment = Alignment.Bottom
+                      ) {
+                          days.forEach { d ->
+                              val t = d.wifi + d.mobile
+                              val h = maxOf(2f, 90f * t / max).dp
+                              Box(Modifier.weight(1f).height(h).clip(RoundedCornerShape(3.dp)).background(cs.surfaceVariant)) {
+                                  if (t > 0) Column(Modifier.fillMaxSize()) {
+                                      if (d.mobile > 0) Box(Modifier.weight(d.mobile.toFloat()).fillMaxWidth().background(MobileColor))
+                                      if (d.wifi > 0) Box(Modifier.weight(d.wifi.toFloat()).fillMaxWidth().background(WifiColor))
+                                  }
+                              }
+                          }
+                      }
+                      Spacer(Modifier.height(4.dp))
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                          days.forEachIndexed { i, d ->
+                              Text(
+                                  if (mode == 1 || i % 5 == 0) d.label else "",
+                                  Modifier.weight(1f), textAlign = TextAlign.Center,
+                                  fontSize = 9.sp, color = cs.onSurfaceVariant, maxLines = 1
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun AppRow(a: AppUsage, max: Float) {
+              val cs = MaterialTheme.colorScheme
+              Surface(shape = RoundedCornerShape(20.dp), color = cs.surface, tonalElevation = 1.dp) {
+                  Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                      if (a.icon != null) {
+                          Image(a.icon, null, Modifier.size(46.dp).clip(RoundedCornerShape(12.dp)))
+                      } else {
+                          Box(Modifier.size(46.dp).clip(RoundedCornerShape(12.dp)).background(cs.surfaceVariant))
+                      }
+                      Spacer(Modifier.width(12.dp))
+                      Column(Modifier.weight(1f)) {
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Text(
+                                  a.label, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                  fontWeight = FontWeight.SemiBold, fontSize = 15.sp, color = cs.onSurface
+                              )
+                              Spacer(Modifier.width(8.dp))
+                              Text(fmt(a.total), fontWeight = FontWeight.Bold, fontSize = 15.sp, color = cs.primary)
+                          }
+                          Text(a.pkg, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 11.sp, color = cs.onSurfaceVariant)
+                          Spacer(Modifier.height(8.dp))
+                          Box(Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)).background(cs.surfaceVariant)) {
+                              val f = (a.total / max).coerceIn(0f, 1f)
+                              if (a.total > 0) {
+                                  Row(Modifier.fillMaxWidth(f).fillMaxHeight()) {
+                                      if (a.wifi > 0) Box(Modifier.weight(a.wifi.toFloat()).fillMaxHeight().background(WifiColor))
+                                      if (a.mobile > 0) Box(Modifier.weight(a.mobile.toFloat()).fillMaxHeight().background(MobileColor))
+                                  }
+                              }
+                          }
+                          Spacer(Modifier.height(6.dp))
+                          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                              Text(
+                                  buildAnnotatedString {
+                                      withStyle(SpanStyle(color = WifiColor)) { append("● ") }
+                                      append("${fmt(a.wifi)}   ")
+                                      withStyle(SpanStyle(color = MobileColor)) { append("● ") }
+                                      append(fmt(a.mobile))
+                                  },
+                                  fontSize = 11.sp, color = cs.onSurfaceVariant
+                              )
+                              Text("🕒 ${fmtTime(a.fgMs)}", fontSize = 11.sp, color = cs.onSurfaceVariant)
+                          }
+                      }
+                  }
+              }
+          }
+
+          // ---------- 設定画面 ----------
+          @Composable
+          fun Section(title: String, content: @Composable ColumnScope.() -> Unit) {
+              val cs = MaterialTheme.colorScheme
+              Surface(shape = RoundedCornerShape(20.dp), color = cs.surface, tonalElevation = 1.dp) {
+                  Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                      Text(title, fontWeight = FontWeight.Bold, fontSize = 15.sp, color = cs.onSurface)
+                      content()
+                  }
+              }
+          }
+
+          @Composable
+          fun SettingsScreen(onBack: () -> Unit) {
+              val ctx = LocalContext.current
+              val cs = MaterialTheme.colorScheme
+              val prefs = remember { ctx.getSharedPreferences("s", 0) }
+              var hz by remember { mutableStateOf(prefs.getBoolean("hz", true)) }
+              var preset by remember { mutableIntStateOf(prefs.getInt("preset", 0)) }
+              var name by remember { mutableStateOf("") }
+              var emoji by remember { mutableStateOf("📶") }
+              var colorIdx by remember { mutableIntStateOf(0) }
+              val colors = listOf(0xFF5B6CFFL, 0xFFE5484DL, 0xFF30A46CL, 0xFFF5A524L, 0xFF111111L)
+              BackHandler { onBack() }
+
+              LazyColumn(
+                  Modifier.fillMaxSize(),
+                  contentPadding = PaddingValues(16.dp),
+                  verticalArrangement = Arrangement.spacedBy(14.dp)
+              ) {
+                  item {
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          TextButton(onClick = onBack) { Text("◀ 戻る") }
+                          Spacer(Modifier.width(8.dp))
+                          Text("設定", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = cs.onBackground)
+                      }
+                  }
+                  item {
+                      Section("表示") {
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Column(Modifier.weight(1f)) {
+                                  Text("高リフレッシュレート（最大120Hz）", color = cs.onSurface)
+                                  Text(
+                                      "対応端末でスクロールが滑らかになります。バッテリー消費は少し増えます。",
+                                      fontSize = 12.sp, color = cs.onSurfaceVariant
+                                  )
+                              }
+                              Switch(checked = hz, onCheckedChange = {
+                                  hz = it
+                                  prefs.edit().putBoolean("hz", it).apply()
+                                  (ctx as? Activity)?.let { a -> applyRefreshRate(a, it) }
+                              })
+                          }
+                      }
+                  }
+                  item {
+                      Section("ホーム画面のアイコンと名前（プリセット）") {
+                          PRESET_LABELS.forEachIndexed { i, label ->
+                              val select = {
+                                  preset = i
+                                  prefs.edit().putInt("preset", i).apply()
+                                  setLauncherPreset(ctx, i)
+                                  Toast.makeText(ctx, "反映まで数秒〜数十秒かかります", Toast.LENGTH_SHORT).show()
+                              }
+                              Row(Modifier.fillMaxWidth().clickable { select() }, verticalAlignment = Alignment.CenterVertically) {
+                                  RadioButton(selected = preset == i, onClick = { select() })
+                                  Text(label, color = cs.onSurface)
+                              }
+                          }
+                      }
+                  }
+                  item {
+                      Section("好きな名前・アイコンでホーム画面に追加") {
+                          OutlinedTextField(
+                              value = name, onValueChange = { name = it },
+                              label = { Text("アプリ名") }, singleLine = true, modifier = Modifier.fillMaxWidth()
+                          )
+                          OutlinedTextField(
+                              value = emoji, onValueChange = { emoji = it.take(4) },
+                              label = { Text("アイコンの絵文字") }, singleLine = true, modifier = Modifier.fillMaxWidth()
+                          )
+                          Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                              colors.forEachIndexed { i, c ->
+                                  Box(
+                                      Modifier.size(36.dp).clip(CircleShape).background(Color(c))
+                                          .then(if (colorIdx == i) Modifier.border(3.dp, cs.onSurface, CircleShape) else Modifier)
+                                          .clickable { colorIdx = i }
+                                  )
+                              }
+                          }
+                          Button(onClick = {
+                              val ok = pinShortcut(ctx, name, emoji, Color(colors[colorIdx]).toArgb())
+                              Toast.makeText(ctx, if (ok) "追加の確認画面で許可してください" else "このホーム画面は非対応です", Toast.LENGTH_SHORT).show()
+                          }) { Text("ホーム画面に追加") }
+                      }
+                  }
+                  item {
+                      Section("パッケージ名") {
+                          Text(
+                              "アプリ内からは変更できません。GitHub の Actions → Build APK → Run workflow で、アプリ名とパッケージ名を入力してビルドし直してください（別のアプリとしてインストールされます）。",
+                              fontSize = 13.sp, color = cs.onSurfaceVariant
+                          )
+                      }
+                  }
+              }
+          }
+          EOF
+      - run: gradle assembleDebug --no-daemon
+      - name: APKの場所を確認
+        run: find app/build/outputs -name "*.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DataUsage-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+      - name: Releaseに公開
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk \
+            --title "Build ${{ github.run_number }}" --notes "APK"
