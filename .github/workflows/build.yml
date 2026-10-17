@@ -44,8 +44,8 @@ jobs:
                   applicationId = "com.example.datausage"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "1.1"
               }
               buildFeatures { compose = true }
               compileOptions {
@@ -59,6 +59,7 @@ jobs:
               implementation("androidx.compose.ui:ui")
               implementation("androidx.compose.material3:material3")
               implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.core:core-ktx:1.13.1")
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
           }
           EOF
@@ -67,7 +68,7 @@ jobs:
               xmlns:tools="http://schemas.android.com/tools">
               <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
               <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
-              <application android:label="DataUsage" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+              <application android:label="DataUsage" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
                   <activity android:name=".MainActivity" android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
@@ -83,38 +84,102 @@ jobs:
           import android.app.AppOpsManager
           import android.app.usage.NetworkStats
           import android.app.usage.NetworkStatsManager
+          import android.app.usage.UsageStatsManager
           import android.content.Context
           import android.content.Intent
+          import android.content.IntentFilter
           import android.net.ConnectivityManager
           import android.net.TrafficStats
+          import android.os.BatteryManager
           import android.os.Bundle
           import android.os.Process
           import android.provider.Settings
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.setContent
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.isSystemInDarkTheme
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.LazyColumn
           import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.compose.ui.graphics.asImageBitmap
           import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.SpanStyle
+          import androidx.compose.ui.text.buildAnnotatedString
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.text.withStyle
           import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.graphics.drawable.toBitmap
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.delay
           import kotlinx.coroutines.withContext
           import java.util.Calendar
 
+          private val WifiColor = Color(0xFF4FC3F7)
+          private val MobileColor = Color(0xFFFFB74D)
+
+          private val DarkScheme = darkColorScheme(
+              primary = Color(0xFF8FA8FF),
+              background = Color(0xFF0E1117),
+              surface = Color(0xFF171B24),
+              onBackground = Color(0xFFE8EAF0),
+              onSurface = Color(0xFFE8EAF0),
+              onSurfaceVariant = Color(0xFF9AA3B5),
+              surfaceVariant = Color(0xFF262C38)
+          )
+          private val LightScheme = lightColorScheme(
+              primary = Color(0xFF4A63E7),
+              background = Color(0xFFF3F5FB),
+              surface = Color.White,
+              onBackground = Color(0xFF14171F),
+              onSurface = Color(0xFF14171F),
+              onSurfaceVariant = Color(0xFF6B7385),
+              surfaceVariant = Color(0xFFE4E8F2)
+          )
+
           class MainActivity : ComponentActivity() {
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
-                  setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { Root() } } }
+                  setContent {
+                      MaterialTheme(colorScheme = if (isSystemInDarkTheme()) DarkScheme else LightScheme) {
+                          Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { Root() }
+                      }
+                  }
               }
           }
 
-          data class AppUsage(val label: String, val pkg: String, val wifi: Long, val mobile: Long) {
+          data class AppUsage(
+              val label: String, val pkg: String,
+              val wifi: Long, val mobile: Long, val fgMs: Long,
+              val icon: ImageBitmap?
+          ) {
               val total get() = wifi + mobile
+          }
+
+          data class Batt(val pct: Int, val charging: Boolean, val tempC: Float)
+
+          fun readBattery(ctx: Context): Batt {
+              val i = ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+              val lv = i?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+              val sc = i?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+              val st = i?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+              val t = i?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
+              return Batt(
+                  if (lv < 0) 0 else lv * 100 / sc,
+                  st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL,
+                  t / 10f
+              )
           }
 
           fun hasUsageAccess(ctx: Context): Boolean {
@@ -131,6 +196,16 @@ jobs:
               else -> "$b B"
           }
 
+          fun fmtTime(ms: Long): String {
+              val m = ms / 60000
+              return when {
+                  m >= 60 -> "${m / 60}時間${m % 60}分"
+                  m >= 1 -> "${m}分"
+                  ms > 0 -> "1分未満"
+                  else -> "-"
+              }
+          }
+
           private fun sumByUid(nsm: NetworkStatsManager, type: Int, start: Long, end: Long): Map<Int, Long> {
               val map = HashMap<Int, Long>()
               val stats = nsm.querySummary(type, null, start, end)
@@ -143,7 +218,17 @@ jobs:
               return map
           }
 
-          /** range: 0=today, 1=7 days, 2=30 days */
+          private val iconCache = HashMap<String, ImageBitmap?>()
+
+          private fun iconOf(ctx: Context, pkg: String): ImageBitmap? = synchronized(iconCache) {
+              iconCache.getOrPut(pkg) {
+                  runCatching {
+                      ctx.packageManager.getApplicationIcon(pkg).toBitmap(96, 96).asImageBitmap()
+                  }.getOrNull()
+              }
+          }
+
+          /** range: 0=今日, 1=7日間, 2=30日間 */
           fun loadUsage(ctx: Context, range: Int): List<AppUsage> {
               val nsm = ctx.getSystemService(Context.NETWORK_STATS_SERVICE) as NetworkStatsManager
               val cal = Calendar.getInstance().apply {
@@ -156,16 +241,25 @@ jobs:
               val wifi = sumByUid(nsm, ConnectivityManager.TYPE_WIFI, start, end)
               val mobile = sumByUid(nsm, ConnectivityManager.TYPE_MOBILE, start, end)
               val pm = ctx.packageManager
-              return (wifi.keys + mobile.keys).distinct().mapNotNull { uid ->
-                  val w = wifi[uid] ?: 0L
-                  val m = mobile[uid] ?: 0L
-                  if (w + m == 0L) return@mapNotNull null
-                  val pkg = pm.getPackagesForUid(uid)?.firstOrNull()
-                  val label = pkg?.let {
-                      runCatching { pm.getApplicationLabel(pm.getApplicationInfo(it, 0)).toString() }.getOrNull()
-                  } ?: "System/Other (uid $uid)"
-                  AppUsage(label, pkg ?: "-", w, m)
-              }.sortedByDescending { it.total }
+
+              // [0]=wifi, [1]=mobile, [2]=画面使用時間(ms)
+              val byPkg = HashMap<String, LongArray>()
+              fun keyOf(uid: Int) = pm.getPackagesForUid(uid)?.firstOrNull() ?: "uid:$uid"
+              wifi.forEach { (uid, v) -> byPkg.getOrPut(keyOf(uid)) { LongArray(3) }[0] += v }
+              mobile.forEach { (uid, v) -> byPkg.getOrPut(keyOf(uid)) { LongArray(3) }[1] += v }
+
+              val usm = ctx.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+              usm.queryAndAggregateUsageStats(start, end).forEach { (p, s) ->
+                  if (s.totalTimeInForeground > 0) byPkg.getOrPut(p) { LongArray(3) }[2] = s.totalTimeInForeground
+              }
+
+              return byPkg.mapNotNull { (pkg, a) ->
+                  if (a.all { it == 0L }) return@mapNotNull null
+                  val label = runCatching {
+                      pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+                  }.getOrNull() ?: if (pkg.startsWith("uid:")) "システム/その他 ($pkg)" else pkg
+                  AppUsage(label, pkg, a[0], a[1], a[2], iconOf(ctx, pkg))
+              }
           }
 
           @Composable
@@ -177,14 +271,23 @@ jobs:
               }
               if (granted) UsageScreen() else {
                   Column(
-                      Modifier.fillMaxSize().padding(24.dp),
+                      Modifier.fillMaxSize().padding(32.dp),
                       verticalArrangement = Arrangement.Center,
                       horizontalAlignment = Alignment.CenterHorizontally
                   ) {
-                      Text("通信量を取得するには「使用状況へのアクセス」の許可が必要です。")
+                      Text("📶", fontSize = 56.sp)
                       Spacer(Modifier.height(16.dp))
+                      Text("使用状況へのアクセスを許可してください", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                      Spacer(Modifier.height(8.dp))
+                      Text(
+                          "通信量と画面使用時間の取得に必要です。設定でこのアプリをオンにしてください。",
+                          color = MaterialTheme.colorScheme.onSurfaceVariant
+                      )
+                      Spacer(Modifier.height(24.dp))
                       Button(onClick = {
-                          ctx.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                          ctx.startActivity(
+                              Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                          )
                       }) { Text("設定を開く") }
                   }
               }
@@ -194,12 +297,15 @@ jobs:
           fun UsageScreen() {
               val ctx = LocalContext.current
               var range by remember { mutableIntStateOf(0) }
+              var sortBy by remember { mutableIntStateOf(0) }
               var list by remember { mutableStateOf(emptyList<AppUsage>()) }
               var speed by remember { mutableStateOf(0L to 0L) }
+              var batt by remember { mutableStateOf(readBattery(ctx)) }
 
               LaunchedEffect(range) {
                   while (true) {
                       list = withContext(Dispatchers.IO) { loadUsage(ctx, range) }
+                      batt = readBattery(ctx)
                       delay(3000)
                   }
               }
@@ -215,31 +321,117 @@ jobs:
                   }
               }
 
-              val max = (list.firstOrNull()?.total ?: 1L).toFloat()
-              Column(Modifier.fillMaxSize().padding(16.dp)) {
-                  Text("現在の速度", style = MaterialTheme.typography.labelMedium)
-                  Text("↓ ${fmt(speed.first)}/s   ↑ ${fmt(speed.second)}/s", style = MaterialTheme.typography.titleLarge)
-                  Spacer(Modifier.height(12.dp))
-                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                      listOf("今日", "7日間", "30日間").forEachIndexed { i, s ->
-                          FilterChip(selected = range == i, onClick = { range = i }, label = { Text(s) })
+              val sorted = if (sortBy == 0) list.sortedByDescending { it.total } else list.sortedByDescending { it.fgMs }
+              val max = (list.maxOfOrNull { it.total } ?: 1L).coerceAtLeast(1L).toFloat()
+
+              LazyColumn(
+                  Modifier.fillMaxSize(),
+                  contentPadding = PaddingValues(16.dp),
+                  verticalArrangement = Arrangement.spacedBy(12.dp)
+              ) {
+                  item { Header(speed, list, batt) }
+                  item {
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                          listOf("今日", "7日間", "30日間").forEachIndexed { i, s ->
+                              FilterChip(
+                                  selected = range == i, onClick = { range = i },
+                                  label = { Text(s) }, shape = RoundedCornerShape(50)
+                              )
+                          }
+                          Spacer(Modifier.weight(1f))
+                          FilterChip(
+                              selected = sortBy == 1,
+                              onClick = { sortBy = if (sortBy == 0) 1 else 0 },
+                              label = { Text(if (sortBy == 0) "通信量順" else "使用時間順") },
+                              shape = RoundedCornerShape(50)
+                          )
                       }
                   }
-                  Spacer(Modifier.height(8.dp))
-                  Text("合計: ${fmt(list.sumOf { it.total })}  (Wi-Fi ${fmt(list.sumOf { it.wifi })} / モバイル ${fmt(list.sumOf { it.mobile })})")
-                  Spacer(Modifier.height(8.dp))
-                  LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                      items(list, key = { it.pkg + it.label }) { a ->
-                          Column {
-                              Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                  Text(a.label, Modifier.weight(1f), maxLines = 1)
-                                  Text(fmt(a.total))
-                              }
-                              LinearProgressIndicator(progress = { a.total / max }, Modifier.fillMaxWidth())
+                  items(sorted, key = { it.pkg }) { a -> AppRow(a, max) }
+              }
+          }
+
+          @Composable
+          fun Stat(label: String, value: String) {
+              Column {
+                  Text(label, color = Color.White.copy(alpha = 0.7f), fontSize = 11.sp)
+                  Text(value, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+              }
+          }
+
+          @Composable
+          fun Header(speed: Pair<Long, Long>, list: List<AppUsage>, batt: Batt) {
+              Box(
+                  Modifier.fillMaxWidth()
+                      .clip(RoundedCornerShape(28.dp))
+                      .background(Brush.linearGradient(listOf(Color(0xFF5B6CFF), Color(0xFF9B5CFF))))
+                      .padding(20.dp)
+              ) {
+                  Column {
+                      Text("リアルタイム速度", color = Color.White.copy(alpha = 0.75f), fontSize = 12.sp)
+                      Text("↓ ${fmt(speed.first)}/s", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+                      Text("↑ ${fmt(speed.second)}/s", color = Color.White.copy(alpha = 0.9f), fontSize = 16.sp)
+                      Spacer(Modifier.height(18.dp))
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                          Stat("合計", fmt(list.sumOf { it.total }))
+                          Stat("Wi-Fi", fmt(list.sumOf { it.wifi }))
+                          Stat("モバイル", fmt(list.sumOf { it.mobile }))
+                      }
+                      Spacer(Modifier.height(16.dp))
+                      Text(
+                          "🔋 ${batt.pct}%" + (if (batt.charging) " ⚡充電中" else "") + "  ・  🌡 ${"%.1f".format(batt.tempC)}°C",
+                          color = Color.White.copy(alpha = 0.9f), fontSize = 13.sp
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          fun AppRow(a: AppUsage, max: Float) {
+              val cs = MaterialTheme.colorScheme
+              Surface(shape = RoundedCornerShape(20.dp), color = cs.surface, tonalElevation = 1.dp) {
+                  Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                      if (a.icon != null) {
+                          Image(a.icon, null, Modifier.size(46.dp).clip(RoundedCornerShape(12.dp)))
+                      } else {
+                          Box(Modifier.size(46.dp).clip(RoundedCornerShape(12.dp)).background(cs.surfaceVariant))
+                      }
+                      Spacer(Modifier.width(12.dp))
+                      Column(Modifier.weight(1f)) {
+                          Row(verticalAlignment = Alignment.CenterVertically) {
                               Text(
-                                  "Wi-Fi ${fmt(a.wifi)} / モバイル ${fmt(a.mobile)}",
-                                  style = MaterialTheme.typography.bodySmall
+                                  a.label, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                  fontWeight = FontWeight.SemiBold, fontSize = 15.sp, color = cs.onSurface
                               )
+                              Spacer(Modifier.width(8.dp))
+                              Text(fmt(a.total), fontWeight = FontWeight.Bold, fontSize = 15.sp, color = cs.primary)
+                          }
+                          Text(
+                              a.pkg, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                              fontSize = 11.sp, color = cs.onSurfaceVariant
+                          )
+                          Spacer(Modifier.height(8.dp))
+                          Box(Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)).background(cs.surfaceVariant)) {
+                              val f = (a.total / max).coerceIn(0f, 1f)
+                              if (a.total > 0) {
+                                  Row(Modifier.fillMaxWidth(f).fillMaxHeight()) {
+                                      if (a.wifi > 0) Box(Modifier.weight(a.wifi.toFloat()).fillMaxHeight().background(WifiColor))
+                                      if (a.mobile > 0) Box(Modifier.weight(a.mobile.toFloat()).fillMaxHeight().background(MobileColor))
+                                  }
+                              }
+                          }
+                          Spacer(Modifier.height(6.dp))
+                          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                              Text(
+                                  buildAnnotatedString {
+                                      withStyle(SpanStyle(color = WifiColor)) { append("● ") }
+                                      append("${fmt(a.wifi)}   ")
+                                      withStyle(SpanStyle(color = MobileColor)) { append("● ") }
+                                      append(fmt(a.mobile))
+                                  },
+                                  fontSize = 11.sp, color = cs.onSurfaceVariant
+                              )
+                              Text("🕒 ${fmtTime(a.fgMs)}", fontSize = 11.sp, color = cs.onSurfaceVariant)
                           }
                       }
                   }
